@@ -109,6 +109,10 @@ struct DevEntry {
 
 	uint32_t *mask;
 	size_t nb_words;
+
+	pthread_mutex_t readers_lock;
+	pthread_cond_t readers_cond;
+	volatile unsigned int nb_readers;
 };
 
 struct sample_cb_info {
@@ -436,11 +440,38 @@ static ssize_t receive_sample(const struct iio_channel *chn,
 	return read_all(info->pdata, dst, length);
 }
 
-static ssize_t send_data(struct DevEntry *dev, struct ThdEntry *thd, size_t len)
+static void signal_thread(struct ThdEntry *thd, ssize_t ret)
 {
+	thd->err = ret;
+	thd->nb = 0;
+	thd->active = false;
+	thd_entry_event_signal(thd);
+}
+
+
+static void data_transfer_done(struct ThdEntry *thd, ssize_t ret)
+{
+	struct DevEntry *dev = thd->entry;
+
+	if (ret > 0)
+		thd->nb -= ret;
+
+	if (ret < 0 || thd->nb < dev->sample_size)
+		signal_thread(thd, (ret < 0) ? ret : (ssize_t) thd->nb);
+
+	pthread_mutex_lock(&dev->readers_lock);
+	if (!--dev->nb_readers)
+		pthread_cond_signal(&dev->readers_cond);
+	pthread_mutex_unlock(&dev->readers_lock);
+}
+
+static void send_data_legacy(struct ThdEntry *thd, size_t len)
+{
+	struct DevEntry *dev = thd->entry;
 	struct parser_pdata *pdata = thd->pdata;
 	bool demux = server_demux && dev->sample_size != thd->sample_size;
 	void *start;
+	ssize_t ret;
 
 	if (demux)
 		len = (len / dev->sample_size) * thd->sample_size;
@@ -453,7 +484,7 @@ static ssize_t send_data(struct DevEntry *dev, struct ThdEntry *thd, size_t len)
 		unsigned int i;
 		char buf[129], *ptr = buf;
 		uint32_t *mask = demux ? thd->mask : dev->mask;
-		ssize_t ret, length;
+		ssize_t length;
 
 		length = sizeof(buf);
 		/* Send the current mask */
@@ -468,12 +499,13 @@ static ssize_t send_data(struct DevEntry *dev, struct ThdEntry *thd, size_t len)
 
 		if (length < 0) {
 			IIO_ERROR("send_data: string length error\n");
-			return -ENOSPC;
+			ret = -ENOSPC;
+			goto out_transfer_done;
 		}
 
 		ret = write_all(pdata, buf, ptr + 1 - buf);
 		if (ret < 0)
-			return ret;
+			goto out_transfer_done;
 
 		thd->new_client = false;
 	}
@@ -481,7 +513,7 @@ static ssize_t send_data(struct DevEntry *dev, struct ThdEntry *thd, size_t len)
 	if (!demux) {
 		/* Short path */
 		start = iio_buffer_start(dev->buf);
-		return write_all(pdata, start, len);
+		ret = write_all(pdata, start, len);
 	} else {
 		struct sample_cb_info info = {
 			.pdata = pdata,
@@ -490,8 +522,18 @@ static ssize_t send_data(struct DevEntry *dev, struct ThdEntry *thd, size_t len)
 			.mask = thd->mask,
 		};
 
-		return iio_buffer_foreach_sample(dev->buf, send_sample, &info);
+		ret = iio_buffer_foreach_sample(dev->buf, send_sample, &info);
 	}
+
+out_transfer_done:
+	data_transfer_done(thd, ret);
+}
+
+static void send_data(struct ThdEntry *thd, size_t len)
+{
+	thd->entry->nb_readers++;
+
+	send_data_legacy(thd, len);
 }
 
 static ssize_t receive_data(struct DevEntry *dev, struct ThdEntry *thd)
@@ -541,17 +583,22 @@ static void dev_entry_put(struct DevEntry *entry)
 		pthread_mutex_destroy(&entry->thdlist_lock);
 		pthread_cond_destroy(&entry->rw_ready_cond);
 
+		pthread_mutex_destroy(&entry->readers_lock);
+		pthread_cond_destroy(&entry->readers_cond);
+
 		free(entry->mask);
 		free(entry);
 	}
 }
 
-static void signal_thread(struct ThdEntry *thd, ssize_t ret)
+static void wait_refill_ready(struct DevEntry *dev)
 {
-	thd->err = ret;
-	thd->nb = 0;
-	thd->active = false;
-	thd_entry_event_signal(thd);
+	pthread_mutex_lock(&dev->readers_lock);
+
+	while (dev->nb_readers)
+		pthread_cond_wait(&dev->readers_cond, &dev->readers_lock);
+
+	pthread_mutex_unlock(&dev->readers_lock);
 }
 
 static void rw_thd(struct thread_pool *pool, void *d)
@@ -660,6 +707,8 @@ static void rw_thd(struct thread_pool *pool, void *d)
 		if (has_readers) {
 			ssize_t nb_bytes;
 
+			wait_refill_ready(entry);
+
 			ret = iio_buffer_refill(entry->buf);
 
 			pthread_mutex_lock(&entry->thdlist_lock);
@@ -693,16 +742,8 @@ static void rw_thd(struct thread_pool *pool, void *d)
 					thd; thd = next_thd) {
 				next_thd = SLIST_NEXT(thd, dev_list_entry);
 
-				if (!thd->active || thd->is_writer)
-					continue;
-
-				ret = send_data(entry, thd, nb_bytes);
-				if (ret > 0)
-					thd->nb -= ret;
-
-				if (ret < 0 || thd->nb < sample_size)
-					signal_thread(thd, (ret < 0) ?
-							ret : (ssize_t) thd->nb);
+				if (thd->active && !thd->is_writer)
+					send_data(thd, nb_bytes);
 			}
 
 			pthread_mutex_unlock(&entry->thdlist_lock);
@@ -1082,6 +1123,9 @@ retry:
 
 	pthread_mutex_init(&entry->thdlist_lock, NULL);
 	pthread_cond_init(&entry->rw_ready_cond, NULL);
+
+	pthread_mutex_init(&entry->readers_lock, NULL);
+	pthread_cond_init(&entry->readers_cond, NULL);
 
 	ret = thread_pool_add_thread(main_thread_pool, rw_thd, entry, "rw_thd");
 	if (ret) {
