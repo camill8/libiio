@@ -439,8 +439,9 @@ void free_device(struct iio_device *dev)
 	free(dev);
 }
 
-ssize_t iio_device_get_sample_size_mask(const struct iio_device *dev,
-		const uint32_t *mask, size_t words)
+static ssize_t iio_device_compute_sample_size(const struct iio_device *dev,
+					      const uint32_t *mask,
+					      size_t words, bool max)
 {
 	ssize_t size = 0;
 	unsigned int i;
@@ -456,7 +457,7 @@ ssize_t iio_device_get_sample_size_mask(const struct iio_device *dev,
 
 		if (chn->index < 0)
 			break;
-		if (!TEST_BIT(mask, chn->number))
+		if (!max && !TEST_BIT(mask, chn->number))
 			continue;
 
 		if (prev && chn->index == prev->index) {
@@ -474,9 +475,20 @@ ssize_t iio_device_get_sample_size_mask(const struct iio_device *dev,
 	return size;
 }
 
+ssize_t iio_device_get_sample_size_mask(const struct iio_device *dev,
+		const uint32_t *mask, size_t words)
+{
+	return iio_device_compute_sample_size(dev, mask, words, false);
+}
+
 ssize_t iio_device_get_sample_size(const struct iio_device *dev)
 {
 	return iio_device_get_sample_size_mask(dev, dev->mask, dev->words);
+}
+
+ssize_t iio_device_get_max_sample_size(const struct iio_device *dev)
+{
+	return iio_device_compute_sample_size(dev, dev->mask, dev->words, true);
 }
 
 int iio_device_attr_read_longlong(const struct iio_device *dev,

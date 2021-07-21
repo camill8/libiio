@@ -193,6 +193,7 @@ int iio_dynamic_scan(const struct iio_context_params *params,
 
 ssize_t iio_device_get_sample_size_mask(const struct iio_device *dev,
 		const uint32_t *mask, size_t words);
+ssize_t iio_device_get_max_sample_size(const struct iio_device *dev);
 
 void iio_channel_init_finalize(struct iio_channel *chn);
 unsigned int find_channel_modifier(const char *s, size_t *len_p);
