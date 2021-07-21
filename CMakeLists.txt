@@ -481,8 +481,13 @@ if (NEED_THREADS)
 	endif()
 endif()
 
+if (IIOD_CLIENT OR WITH_IIOD)
+	add_library(iiod-responder STATIC iiod-responder.c)
+endif()
+
 if (IIOD_CLIENT)
 	target_sources(iio PRIVATE iiod-client.c)
+	target_link_libraries(iio PRIVATE iiod-responder)
 endif()
 
 if(WITH_TESTS)
