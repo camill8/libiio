@@ -413,10 +413,10 @@ int main(int argc, char **argv)
 		}
 	}
 
-	ctx = iio_create_context(NULL, "local:");
+	ctx = iio_create_context(NULL, NULL);
 	if (!ctx) {
 		iio_strerror(errno, err_str, sizeof(err_str));
-		IIO_ERROR("Unable to create local context: %s\n", err_str);
+		IIO_ERROR("Unable to create context: %s\n", err_str);
 		return EXIT_FAILURE;
 	}
 
