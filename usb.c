@@ -359,6 +359,16 @@ static ssize_t usb_write(const struct iio_device *dev,
 	return iiod_client_write(client, dev, src, len);
 }
 
+static ssize_t usb_get_buffer(const struct iio_device *dev,
+			      void **addr_ptr, size_t bytes_used,
+			      uint32_t *mask, size_t words)
+{
+	struct iio_device_pdata *pdata = iio_device_get_pdata(dev);
+
+	return iiod_client_get_buffer(pdata->client_io, addr_ptr, bytes_used,
+				      mask, words);
+}
+
 static ssize_t usb_read_dev_attr(const struct iio_device *dev,
 		const char *attr, char *dst, size_t len, enum iio_attr_type type)
 {
@@ -556,6 +566,7 @@ static const struct iio_backend_ops usb_ops = {
 	.close = usb_close,
 	.read = usb_read,
 	.write = usb_write,
+	.get_buffer = usb_get_buffer,
 	.read_device_attr = usb_read_dev_attr,
 	.read_channel_attr = usb_read_chn_attr,
 	.write_device_attr = usb_write_dev_attr,
