@@ -187,6 +187,16 @@ static ssize_t serial_write(const struct iio_device *dev,
 	return iiod_client_write(pdata->iiod_client, dev, src, len);
 }
 
+static ssize_t serial_get_buffer(const struct iio_device *dev,
+				 void **addr_ptr, size_t bytes_used,
+				 uint32_t *mask, size_t words)
+{
+	struct iio_device_pdata *pdata = iio_device_get_pdata(dev);
+
+	return iiod_client_get_buffer(pdata->client_io, addr_ptr, bytes_used,
+				      mask, words);
+}
+
 static ssize_t serial_read_dev_attr(const struct iio_device *dev,
 		const char *attr, char *dst, size_t len, enum iio_attr_type type)
 {
@@ -360,6 +370,7 @@ static const struct iio_backend_ops serial_ops = {
 	.close = serial_close,
 	.read = serial_read,
 	.write = serial_write,
+	.get_buffer = serial_get_buffer,
 	.read_device_attr = serial_read_dev_attr,
 	.write_device_attr = serial_write_dev_attr,
 	.read_channel_attr = serial_read_chn_attr,
