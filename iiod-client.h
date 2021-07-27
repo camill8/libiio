@@ -87,6 +87,10 @@ iiod_client_create_context(struct iiod_client *client,
 			   const char **ctx_values,
 			   unsigned int nb_ctx_attrs);
 
+__api ssize_t iiod_client_get_buffer(struct iiod_client_io *io,
+				     void **addr_ptr, size_t bytes_used,
+				     uint32_t *mask, size_t words);
+
 #undef __api
 
 #endif /* _IIOD_CLIENT_H */

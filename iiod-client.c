@@ -35,11 +35,14 @@ struct iiod_client {
 
 struct iiod_client_io {
 	struct iiod_client *client;
+	struct iiod_reader *reader;
 	bool cyclic;
 	size_t samples_count;
 	size_t buffer_size;
 
 	const struct iio_device *dev;
+	struct iiod_buf buffers[2][2];
+	unsigned int current_buffer;
 };
 
 static int iiod_client_enable_binary(struct iiod_client *client);
@@ -949,6 +952,10 @@ iiod_client_create_io_context(struct iiod_client *client,
 			      size_t samples_count, bool cyclic)
 {
 	struct iiod_client_io *io;
+	size_t buffer_size, mask_size;
+
+	buffer_size = samples_count * iio_device_get_max_sample_size(dev);
+	mask_size = ((iio_device_get_channels_count(dev) + 31) / 32) * 4;
 
 	io = zalloc(sizeof(*io));
 	if (!io)
@@ -957,15 +964,98 @@ iiod_client_create_io_context(struct iiod_client *client,
 	io->client = client;
 	io->dev = dev;
 	io->samples_count = samples_count;
+	io->buffer_size = buffer_size;
 	io->cyclic = cyclic;
 
+	if (client->responder) {
+		io->reader = iiod_responder_create_reader(client->responder);
+		if (!io->reader)
+			goto err_free_io;
+
+		io->buffers[0][0].size = mask_size;
+		io->buffers[1][0].size = mask_size;
+		io->buffers[0][1].size = buffer_size;
+		io->buffers[1][1].size = buffer_size;
+
+		io->buffers[0][0].ptr = malloc(mask_size);
+		io->buffers[1][0].ptr = malloc(mask_size);
+		io->buffers[0][1].ptr = malloc(buffer_size);
+		io->buffers[1][1].ptr = malloc(buffer_size);
+
+		if (!io->buffers[0][0].ptr || !io->buffers[1][0].ptr ||
+		    !io->buffers[0][1].ptr || !io->buffers[1][1].ptr)
+			goto err_free_buffers;
+	}
+
 	return io;
+
+err_free_buffers:
+	if (client->responder) {
+		free(io->buffers[0][0].ptr);
+		free(io->buffers[1][0].ptr);
+		free(io->buffers[0][1].ptr);
+		free(io->buffers[1][1].ptr);
+		iiod_reader_destroy(io->reader);
+	}
+err_free_io:
+	free(io);
+	return NULL;
 }
 
 static void iiod_client_io_destroy(struct iiod_client_io *io)
 {
+	if (io && io->client->responder) {
+		free(io->buffers[0][0].ptr);
+		free(io->buffers[1][0].ptr);
+		free(io->buffers[0][1].ptr);
+		free(io->buffers[1][1].ptr);
+		iiod_reader_cancel(io->reader);
+		iiod_reader_destroy(io->reader);
+	}
+
 	free(io);
 }
+
+static bool device_is_tx(const struct iio_device *dev)
+{
+	const struct iio_channel *chn;
+	unsigned int i;
+
+	for (i = 0; i < iio_device_get_channels_count(dev); i++) {
+		chn = iio_device_get_channel(dev, i);
+		if (iio_channel_is_output(chn) && iio_channel_is_enabled(chn))
+			return true;
+	}
+
+	return false;
+}
+
+static int iiod_client_open_new(struct iiod_client *client,
+				struct iiod_client_io *io,
+				const struct iio_device *dev,
+				size_t samples_count, bool cyclic)
+{
+	struct iiod_buf buf = { .ptr = dev->mask, .size = dev->words * 4 };
+	struct iiod_command cmd;
+	int ret;
+
+	if (dev->words > 255)
+		return -EINVAL;
+
+	cmd.op = cyclic ? IIOD_OP_OPEN_CYCLIC : IIOD_OP_OPEN;
+	cmd.dev = iio_device_get_index(dev);
+	cmd.code = samples_count;
+
+	ret = iiod_reader_exec_command(io->reader, &cmd, &buf, NULL);
+	if (ret < 0)
+		return ret;
+
+	if (!device_is_tx(dev))
+		iiod_reader_get_response_async(io->reader, io->buffers[1], 2);
+
+	return 0;
+}
+
 
 struct iiod_client_io *
 iiod_client_open_unlocked(struct iiod_client *client,
@@ -982,8 +1072,14 @@ iiod_client_open_unlocked(struct iiod_client *client,
 	if (!io)
 		return ERR_PTR(-ENOMEM);
 
-	if (client->responder)
-		return ERR_PTR(-ENOSYS); /* TODO */
+	if (client->responder) {
+		ret = iiod_client_open_new(client, io, dev,
+					   samples_count, cyclic);
+		if (ret)
+			goto err_destroy_io;
+
+		return io;
+	}
 
 	len = sizeof(buf);
 	len -= iio_snprintf(buf, len, "OPEN %s %lu ",
@@ -1194,4 +1290,65 @@ ssize_t iiod_client_write(struct iiod_client *client,
 	iiod_client_mutex_unlock(client);
 
 	return ret;
+}
+
+static int iiod_client_io_upload_buffer(struct iiod_client_io *io, size_t bytes)
+{
+	struct iiod_command cmd = { 0 };
+
+	cmd.op = IIOD_OP_WRITEBUF;
+	cmd.dev = iio_device_get_index(io->dev);
+	cmd.code = bytes;
+
+	return iiod_reader_send_command(io->reader, &cmd,
+					&io->buffers[io->current_buffer][1], 1);
+}
+
+static int iiod_client_io_swap_buffers(struct iiod_client_io *io, size_t bytes)
+{
+	bool is_tx = device_is_tx(io->dev);
+	unsigned int next = io->current_buffer;
+	int ret;
+
+	if (is_tx)
+		ret = iiod_client_io_upload_buffer(io, bytes);
+
+	io->current_buffer = 1 - io->current_buffer;
+
+	if (is_tx)
+		return ret;
+
+	return iiod_reader_get_and_request_response(io->reader,
+						    io->buffers[next], 2);
+}
+
+ssize_t iiod_client_get_buffer(struct iiod_client_io *io,
+			       void **addr_ptr, size_t bytes_used,
+			       uint32_t *mask, size_t words)
+{
+	uint32_t *mask_ptr;
+	size_t buf_len;
+	ssize_t ret;
+
+	if (!io)
+		return -EBADF;
+
+	if (!io->client->responder)
+		return -ENOSYS;
+
+	if (!addr_ptr || !mask)
+		return -EINVAL;
+
+	ret = iiod_client_io_swap_buffers(io, bytes_used);
+	if (ret < 0)
+		return ret;
+
+	if (addr_ptr)
+		*addr_ptr = io->buffers[io->current_buffer][1].ptr;
+	buf_len = io->buffers[io->current_buffer][1].size;
+	mask_ptr = io->buffers[io->current_buffer][0].ptr;
+
+	memcpy(mask, mask_ptr, words * 4);
+
+	return buf_len;
 }
