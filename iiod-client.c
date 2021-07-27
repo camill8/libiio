@@ -7,6 +7,7 @@
  */
 
 #include "iiod-client.h"
+#include "iiod-responder.h"
 #include "iio-config.h"
 #include "iio-debug.h"
 #include "iio-lock.h"
@@ -25,6 +26,11 @@ struct iiod_client {
 	struct iiod_client_pdata *desc;
 	const struct iiod_client_ops *ops;
 	struct iio_mutex *lock;
+
+	struct iiod_responder *responder;
+
+	/* Reader for synchronous I/O */
+	struct iiod_reader *reader;
 };
 
 struct iiod_client_io {
@@ -35,6 +41,8 @@ struct iiod_client_io {
 
 	const struct iio_device *dev;
 };
+
+static int iiod_client_enable_binary(struct iiod_client *client);
 
 void iiod_client_mutex_lock(struct iiod_client *client)
 {
@@ -168,6 +176,10 @@ struct iiod_client * iiod_client_new(const struct iio_context_params *params,
 	client->params = params;
 	client->ops = ops;
 	client->desc = desc;
+	client->responder = NULL;
+	client->reader = NULL;
+
+	iiod_client_enable_binary(client);
 
 	return client;
 
@@ -178,8 +190,47 @@ err_free_client:
 
 void iiod_client_destroy(struct iiod_client *client)
 {
+	if (client->reader)
+		iiod_reader_destroy(client->reader);
+	if (client->responder)
+		iiod_responder_destroy(client->responder);
+
 	iio_mutex_destroy(client->lock);
 	free(client);
+}
+
+static int iio_device_get_index(const struct iio_device *dev)
+{
+	const struct iio_context *ctx = iio_device_get_context(dev);
+	unsigned int idx;
+
+	for (idx = 0; idx < iio_context_get_devices_count(ctx); idx++)
+		if (dev == iio_context_get_device(ctx, idx))
+			return idx;
+
+	return -ENODEV; /* Cannot happen */
+}
+
+static int iiod_client_get_trigger_new(struct iiod_client *client,
+				       const struct iio_device *dev,
+				       const struct iio_device **trigger)
+{
+	const struct iio_context *ctx = iio_device_get_context(dev);
+	struct iiod_command cmd;
+	int ret;
+
+	cmd.op = IIOD_OP_GETTRIG;
+	cmd.dev = iio_device_get_index(dev);
+
+	ret = iiod_reader_exec_simple_command(client->reader, &cmd);
+	if (ret == -ENODEV)
+		*trigger = NULL;
+	else if (ret >= 0)
+		*trigger = iio_context_get_device(ctx, ret);
+	else
+		return ret;
+
+	return 0;
 }
 
 int iiod_client_get_trigger(struct iiod_client *client,
@@ -191,6 +242,9 @@ int iiod_client_get_trigger(struct iiod_client *client,
 	char buf[1024];
 	unsigned int name_len;
 	int ret;
+
+	if (client->responder)
+		return iiod_client_get_trigger_new(client, dev, trigger);
 
 	iio_snprintf(buf, sizeof(buf), "GETTRIG %s\r\n",
 			iio_device_get_id(dev));
@@ -238,12 +292,31 @@ out_unlock:
 	return ret;
 }
 
+static int iiod_client_set_trigger_new(struct iiod_client *client,
+				       const struct iio_device *dev,
+				       const struct iio_device *trigger)
+{
+	struct iiod_command cmd;
+
+	cmd.op = IIOD_OP_SETTRIG;
+	cmd.dev = iio_device_get_index(dev);
+	if (!trigger)
+		cmd.code = -1;
+	else
+		cmd.code = iio_device_get_index(trigger);
+
+	return iiod_reader_exec_simple_command(client->reader, &cmd);
+}
+
 int iiod_client_set_trigger(struct iiod_client *client,
 			    const struct iio_device *dev,
 			    const struct iio_device *trigger)
 {
 	char buf[1024];
 	int ret;
+
+	if (client->responder)
+		return iiod_client_set_trigger_new(client, dev, trigger);
 
 	if (trigger) {
 		iio_snprintf(buf, sizeof(buf), "SETTRIG %s %s\r\n",
@@ -260,12 +333,31 @@ int iiod_client_set_trigger(struct iiod_client *client,
 	return ret;
 }
 
+static int
+iiod_client_set_kernel_buffers_count_new(struct iiod_client *client,
+					 const struct iio_device *dev,
+					 unsigned int nb_blocks)
+{
+	struct iiod_command cmd;
+
+	cmd.op = IIOD_OP_SETBUFCNT;
+	cmd.dev = iio_device_get_index(dev);
+	cmd.code = nb_blocks;
+
+	return iiod_reader_exec_simple_command(client->reader, &cmd);
+}
+
 int iiod_client_set_kernel_buffers_count(struct iiod_client *client,
 					 const struct iio_device *dev,
 					 unsigned int nb_blocks)
 {
 	int ret;
 	char buf[1024];
+
+	if (client->responder) {
+		return iiod_client_set_kernel_buffers_count_new(client,
+								dev, nb_blocks);
+	}
 
 	iio_snprintf(buf, sizeof(buf), "SET %s BUFFERS_COUNT %u\r\n",
 			iio_device_get_id(dev), nb_blocks);
@@ -279,13 +371,23 @@ int iiod_client_set_kernel_buffers_count(struct iiod_client *client,
 int iiod_client_set_timeout(struct iiod_client *client, unsigned int timeout)
 {
 	int ret;
-	char buf[1024];
 
-	iio_snprintf(buf, sizeof(buf), "TIMEOUT %u\r\n", timeout);
+	if (client->responder) {
+		struct iiod_command cmd;
 
-	iio_mutex_lock(client->lock);
-	ret = iiod_client_exec_command(client, buf);
-	iio_mutex_unlock(client->lock);
+		cmd.op = IIOD_OP_TIMEOUT;
+		cmd.code = timeout;
+
+		ret = iiod_reader_exec_simple_command(client->reader, &cmd);
+	} else {
+		char buf[1024];
+
+		iio_mutex_lock(client->lock);
+		iio_snprintf(buf, sizeof(buf), "TIMEOUT %u\r\n", timeout);
+		ret = iiod_client_exec_command(client, buf);
+		iio_mutex_unlock(client->lock);
+	}
+
 	return ret;
 }
 
@@ -311,6 +413,72 @@ static int iiod_client_discard(struct iiod_client *client,
 	return 0;
 }
 
+static ssize_t iiod_client_read_attr_new(struct iiod_client *client,
+					 const struct iio_device *dev,
+					 const struct iio_channel *chn,
+					 const char *attr, char *dest,
+					 size_t len, enum iio_attr_type type)
+{
+	struct iiod_command cmd = { 0 };
+	unsigned int i;
+	uint16_t arg1, arg2 = 0;
+	struct iiod_buf iiod_buf;
+
+	if (chn) {
+		cmd.op = IIOD_OP_READ_CHN_ATTR;
+
+		for (i = 0; i < iio_device_get_channels_count(dev); i++)
+			if (iio_device_get_channel(dev, i) == chn)
+				break;
+
+		arg2 = i;
+
+		for (i = 0; i < iio_channel_get_attrs_count(chn); i++)
+			if (!strcmp(iio_channel_get_attr(chn, i), attr))
+				break;
+
+		arg1 = i;
+	} else {
+		switch (type) {
+		default:
+			cmd.op = IIOD_OP_READ_ATTR;
+
+			for (i = 0; i < iio_device_get_attrs_count(dev); i++)
+				if (!strcmp(iio_device_get_attr(dev, i), attr))
+					break;
+
+			arg1 = i;
+			break;
+		case IIO_ATTR_TYPE_DEBUG:
+			cmd.op = IIOD_OP_READ_DBG_ATTR;
+
+			for (i = 0; i < iio_device_get_debug_attrs_count(dev); i++)
+				if (!strcmp(iio_device_get_debug_attr(dev, i), attr))
+					break;
+
+			arg1 = i;
+			break;
+		case IIO_ATTR_TYPE_BUFFER:
+			cmd.op = IIOD_OP_READ_BUF_ATTR;
+
+			for (i = 0; i < iio_device_get_buffer_attrs_count(dev); i++)
+				if (!strcmp(iio_device_get_buffer_attr(dev, i), attr))
+					break;
+
+			arg1 = i;
+			break;
+		}
+	}
+
+	cmd.dev = iio_device_get_index(dev);
+	cmd.code = (arg1 << 16) | arg2;
+
+	iiod_buf.ptr = dest;
+	iiod_buf.size = len;
+
+	return iiod_reader_exec_command(client->reader, &cmd, NULL, &iiod_buf);
+}
+
 ssize_t iiod_client_read_attr(struct iiod_client *client,
 			      const struct iio_device *dev,
 			      const struct iio_channel *chn,
@@ -320,6 +488,11 @@ ssize_t iiod_client_read_attr(struct iiod_client *client,
 	const char *id = iio_device_get_id(dev);
 	char buf[1024];
 	ssize_t ret;
+
+	if (client->responder) {
+		return iiod_client_read_attr_new(client, dev, chn,
+						 attr, dest, len, type);
+	}
 
 	if (attr) {
 		if (chn) {
@@ -472,6 +645,186 @@ out_unlock:
 	return ret;
 }
 
+static int iiod_client_cmd(const struct iiod_command *cmd,
+			   struct iiod_command_data *data, void *d)
+{
+	/* We don't support receiving commands. */
+
+	return -EINVAL;
+}
+
+static ssize_t
+iiod_client_read_cb(void *d, const struct iiod_buf *buf, size_t nb)
+{
+	struct iiod_client *client = d;
+	ssize_t ret, count = 0;
+	unsigned int i;
+
+	for (i = 0; i < nb; i++) {
+		ret = iiod_client_read_all(client, buf[i].ptr, buf[i].size);
+		if (ret <= 0)
+			return ret;
+
+		count += ret;
+	}
+
+	return count;
+}
+
+static ssize_t
+iiod_client_write_cb(void *d, const struct iiod_buf *buf, size_t nb)
+{
+	struct iiod_client *client = d;
+	ssize_t ret, count = 0;
+	unsigned int i;
+
+	for (i = 0; i < nb; i++) {
+		return iiod_client_write_all(client, buf[i].ptr, buf[i].size);
+		if (ret <= 0)
+			return ret;
+
+		count += ret;
+	}
+
+	return count;
+}
+
+static ssize_t iiod_client_discard_cb(void *d, size_t bytes)
+{
+	struct iiod_client *client = d;
+	char buf[0x1000];
+	int ret;
+
+	ret = iiod_client_discard(client, buf, sizeof(buf), bytes);
+	if (ret < 0)
+		return ret;
+
+	return bytes;
+}
+
+static const struct iiod_responder_ops iiod_client_ops = {
+	.cmd		= iiod_client_cmd,
+	.read		= iiod_client_read_cb,
+	.write		= iiod_client_write_cb,
+	.discard	= iiod_client_discard_cb,
+};
+
+static int iiod_client_enable_binary(struct iiod_client *client)
+{
+	int ret;
+
+	ret = iiod_client_exec_command(client, "BINARY\r\n");
+
+	/* If the BINARY command fail, don't create the responder */
+	if (ret != 0)
+		return 0;
+
+	client->responder = iiod_responder_create(&iiod_client_ops, client);
+	if (!client->responder) {
+		prm_err(client->params, "Unable to create responder\n");
+		return -ENOMEM;
+	}
+
+	client->reader = iiod_responder_create_reader(client->responder);
+	if (!client->reader) {
+		prm_err(client->params, "Unable to create reader\n");
+		iiod_responder_destroy(client->responder);
+		client->responder = NULL;
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static int iiod_client_send_print(struct iiod_client *client,
+				  void *buf, size_t buf_len)
+{
+	struct iiod_command cmd = { .op = IIOD_OP_PRINT };
+	struct iiod_buf iiod_buf = { .ptr = buf, .size = buf_len };
+
+	return iiod_reader_exec_command(client->reader, &cmd, NULL, &iiod_buf);
+}
+
+static struct iio_context *
+iiod_client_create_context_private_new(struct iiod_client *client,
+				       const struct iio_backend *backend,
+				       const char *description,
+				       const char **ctx_attrs,
+				       const char **ctx_values,
+				       unsigned int nb_ctx_attrs)
+{
+	struct iio_context *ctx = NULL;
+	unsigned long long len;
+	size_t xml_len = 0x10000;
+	char *xml_zstd, *xml;
+	int ret;
+
+	xml = malloc(xml_len);
+	if (!xml)
+		return NULL;
+
+	ret = iiod_client_send_print(client, xml, xml_len);
+	if (ret < 0) {
+		prm_perror(client->params, -ret,
+			   "Unable to send PRINT command");
+		goto out_free_xml;
+	}
+
+	xml_len = ret;
+
+
+	prm_dbg(client->params, "Received ZSTD-compressed XML string.\n");
+
+	len = ZSTD_getFrameContentSize(xml, xml_len);
+	if (len == ZSTD_CONTENTSIZE_UNKNOWN ||
+	    len == ZSTD_CONTENTSIZE_ERROR) {
+		ret = -EIO;
+		goto out_free_xml;
+	}
+
+	xml_zstd = malloc(len);
+	if (!xml_zstd) {
+		ret = -ENOMEM;
+		goto out_free_xml;
+	}
+
+	xml_len = ZSTD_decompress(xml_zstd, len, xml, xml_len);
+	if (ZSTD_isError(xml_len)) {
+		prm_err(client->params, "Unable to decompress ZSTD data: %s\n",
+			ZSTD_getErrorName(xml_len));
+		ret = -EIO;
+		free(xml_zstd);
+		goto out_free_xml;
+	}
+
+	/* Free compressed data, make "xml" point to uncompressed data */
+	free(xml);
+	xml = xml_zstd;
+
+	prm_dbg(client->params, "Creating context\n");
+
+	ctx = iio_create_context_from_xml(client->params, xml, xml_len,
+					  backend, description,
+					  ctx_attrs, ctx_values, nb_ctx_attrs);
+	if (!ctx) {
+		ret = -errno;
+	} else {
+		/* If the context creation suceeded, update our "params" pointer
+		 * to point to the context's params, as we know their lifetime
+		 * is bigger than ours. */
+		client->params = &ctx->params;
+	}
+
+	if (ctx)
+		prm_dbg(client->params, "Context created.\n");
+
+out_free_xml:
+	free(xml);
+	if (!ctx)
+		errno = -ret;
+	return ctx;
+}
+
 static struct iio_context *
 iiod_client_create_context_private(struct iiod_client *client,
 				   const struct iio_backend *backend,
@@ -483,6 +836,7 @@ iiod_client_create_context_private(struct iiod_client *client,
 {
 	const char *cmd = zstd ? "ZPRINT\r\n" : "PRINT\r\n";
 	struct iio_context *ctx = NULL;
+	unsigned int extra_char = !client->responder;
 	size_t xml_len;
 	char *xml;
 	int ret;
@@ -503,14 +857,13 @@ iiod_client_create_context_private(struct iiod_client *client,
 		goto out_unlock;
 
 	xml_len = (size_t) ret;
-	xml = malloc(xml_len + 1);
+	xml = malloc(xml_len + extra_char);
 	if (!xml) {
 		ret = -ENOMEM;
 		goto out_unlock;
 	}
 
-	/* +1: Also read the trailing \n */
-	ret = (int) iiod_client_read_all(client, xml, xml_len + 1);
+	ret = (int) iiod_client_read_all(client, xml, xml_len + extra_char);
 	if (ret < 0)
 		goto out_free_xml;
 
@@ -577,10 +930,17 @@ struct iio_context * iiod_client_create_context(struct iiod_client *client,
 						const char **ctx_values,
 						unsigned int nb_ctx_attrs)
 {
-	return iiod_client_create_context_private(client, backend,
-						  description, ctx_attrs,
-						  ctx_values, nb_ctx_attrs,
-						  WITH_ZSTD);
+	if (!WITH_ZSTD || !client->responder)
+		return iiod_client_create_context_private(client, backend,
+							  description,
+							  ctx_attrs, ctx_values,
+							  nb_ctx_attrs,
+							  WITH_ZSTD);
+
+
+	return iiod_client_create_context_private_new(client, backend,
+						      description, ctx_attrs,
+						      ctx_values, nb_ctx_attrs);
 }
 
 static struct iiod_client_io *
@@ -622,6 +982,9 @@ iiod_client_open_unlocked(struct iiod_client *client,
 	if (!io)
 		return ERR_PTR(-ENOMEM);
 
+	if (client->responder)
+		return ERR_PTR(-ENOSYS); /* TODO */
+
 	len = sizeof(buf);
 	len -= iio_snprintf(buf, len, "OPEN %s %lu ",
 			iio_device_get_id(dev), (unsigned long) samples_count);
@@ -654,12 +1017,20 @@ err_destroy_io:
 
 int iiod_client_close_unlocked(struct iiod_client_io *io)
 {
+	struct iiod_command cmd;
 	char buf[1024];
 	int ret;
 
-	iio_snprintf(buf, sizeof(buf), "CLOSE %s\r\n",
-		     iio_device_get_id(io->dev));
-	ret = iiod_client_exec_command(io->client, buf);
+	if (io->client->responder) {
+		cmd.op = IIOD_OP_CLOSE;
+		cmd.dev = iio_device_get_index(io->dev);
+
+		ret = iiod_reader_exec_simple_command(io->client->reader, &cmd);
+	} else {
+		iio_snprintf(buf, sizeof(buf), "CLOSE %s\r\n",
+			     iio_device_get_id(io->dev));
+		ret = iiod_client_exec_command(io->client, buf);
+	}
 
 	iiod_client_io_destroy(io);
 
@@ -710,6 +1081,9 @@ static ssize_t iiod_client_read_unlocked(struct iiod_client *client,
 	uintptr_t ptr = (uintptr_t) dst;
 	char buf[1024];
 	ssize_t ret, read = 0;
+
+	if (client->responder)
+		return -ENOSYS;
 
 	if (!len || words != (nb_channels + 31) / 32)
 		return -EINVAL;
@@ -779,6 +1153,9 @@ static ssize_t iiod_client_write_unlocked(struct iiod_client *client,
 	ssize_t ret;
 	char buf[1024];
 	int val;
+
+	if (client->responder)
+		return -ENOSYS;
 
 	iio_snprintf(buf, sizeof(buf), "WRITEBUF %s %lu\r\n",
 			dev->id, (unsigned long) len);
