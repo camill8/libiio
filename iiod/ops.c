@@ -11,6 +11,8 @@
 #include "parser.h"
 #include "thread-pool.h"
 
+#include "../iiod-responder.h"
+
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
@@ -40,7 +42,9 @@ struct ThdEntry {
 	struct DevEntry *entry;
 
 	uint32_t *mask;
-	bool active, is_writer, new_client, wait_for_open;
+	bool active, is_writer, new_client, wait_for_open, repeat;
+
+	struct iiod_reader *reader;
 };
 
 static void thd_entry_event_signal(struct ThdEntry *thd)
@@ -349,8 +353,7 @@ ssize_t write_all(struct parser_pdata *pdata, const void *src, size_t len)
 	return ptr - (uintptr_t) src;
 }
 
-static ssize_t read_all(struct parser_pdata *pdata,
-		void *dst, size_t len)
+ssize_t read_all(struct parser_pdata *pdata, void *dst, size_t len)
 {
 	uintptr_t ptr = (uintptr_t) dst;
 
@@ -453,11 +456,13 @@ static void data_transfer_done(struct ThdEntry *thd, ssize_t ret)
 {
 	struct DevEntry *dev = thd->entry;
 
-	if (ret > 0)
-		thd->nb -= ret;
+	if (!thd->repeat) {
+		if (ret > 0)
+			thd->nb -= ret;
 
-	if (ret < 0 || thd->nb < dev->sample_size)
-		signal_thread(thd, (ret < 0) ? ret : (ssize_t) thd->nb);
+		if (ret < 0 || thd->nb < dev->sample_size)
+			signal_thread(thd, (ret < 0) ? ret : (ssize_t) thd->nb);
+	}
 
 	pthread_mutex_lock(&dev->readers_lock);
 	if (!--dev->nb_readers)
@@ -529,11 +534,41 @@ out_transfer_done:
 	data_transfer_done(thd, ret);
 }
 
+static void async_data_done(void *thd, ssize_t ret)
+{
+	data_transfer_done(thd, ret);
+}
+
+static void send_data_binary(struct ThdEntry *thd, size_t len)
+{
+	struct DevEntry *dev = thd->entry;
+	struct parser_pdata *pdata = thd->pdata;
+	struct iiod_buf buf[2];
+	int ret;
+
+	if (len > thd->nb)
+		len = thd->nb;
+
+	buf[0].ptr = dev->mask;
+	buf[0].size = dev->nb_words * 4;
+	buf[1].ptr = iio_buffer_start(dev->buf);
+	buf[1].size = len;
+
+	ret = iiod_reader_send_response_async(thd->reader,
+					      dev->nb_words * 4 + len,
+					      buf, 2, async_data_done, thd);
+	if (ret < 0)
+		data_transfer_done(thd, ret);
+}
+
 static void send_data(struct ThdEntry *thd, size_t len)
 {
 	thd->entry->nb_readers++;
 
-	send_data_legacy(thd, len);
+	if (thd->pdata->binary)
+		send_data_binary(thd, len);
+	else
+		send_data_legacy(thd, len);
 }
 
 static ssize_t receive_data(struct DevEntry *dev, struct ThdEntry *thd)
@@ -850,8 +885,11 @@ static struct ThdEntry *parser_lookup_thd_entry(struct parser_pdata *pdata,
 	return NULL;
 }
 
-static ssize_t rw_buffer(struct parser_pdata *pdata,
-		struct iio_device *dev, unsigned int nb, bool is_write)
+static int rw_buffer_request(struct parser_pdata *pdata,
+			     struct iio_device *dev, unsigned int nb,
+			     bool is_write, bool repeat,
+			     struct DevEntry **deventry,
+			     struct ThdEntry **thdentry)
 {
 	struct DevEntry *entry;
 	struct ThdEntry *thd;
@@ -882,11 +920,36 @@ static ssize_t rw_buffer(struct parser_pdata *pdata,
 
 	thd->new_client = true;
 	thd->nb = nb;
+	thd->repeat = repeat;
 	thd->err = 0;
 	thd->is_writer = is_write;
 	thd->active = true;
 
 	pthread_cond_signal(&entry->rw_ready_cond);
+	pthread_mutex_unlock(&entry->thdlist_lock);
+
+	if (deventry)
+		*deventry = entry;
+	if (thdentry)
+		*thdentry = thd;
+
+	return 0;
+}
+
+static ssize_t rw_buffer(struct parser_pdata *pdata,
+			 struct iio_device *dev, unsigned int nb,
+			 bool is_write, bool repeat)
+{
+	struct DevEntry *entry;
+	struct ThdEntry *thd;
+	ssize_t ret;
+
+	ret = rw_buffer_request(pdata, dev, nb, is_write, repeat,
+				&entry, &thd);
+	if (ret < 0)
+		return ret;
+
+	pthread_mutex_lock(&entry->thdlist_lock);
 
 	IIO_DEBUG("Waiting for completion...\n");
 	while (thd->active) {
@@ -993,9 +1056,23 @@ static ssize_t get_dev_sample_size_mask(const struct iio_device *dev,
 	return size;
 }
 
-static int open_dev_helper(struct parser_pdata *pdata, struct iio_device *dev,
-			   size_t samples_count, uint32_t *words,
-			   size_t nb_words, bool cyclic)
+static bool device_is_tx(const struct iio_device *dev)
+{
+	const struct iio_channel *chn;
+	unsigned int i;
+
+	for (i = 0; i < iio_device_get_channels_count(dev); i++) {
+		chn = iio_device_get_channel(dev, i);
+		if (iio_channel_is_output(chn) && iio_channel_is_enabled(chn))
+			return true;
+	}
+
+	return false;
+}
+
+int open_dev_helper(struct parser_pdata *pdata, struct iio_device *dev,
+		    size_t samples_count, uint32_t *words, size_t nb_words,
+		    bool cyclic, struct iiod_reader *reader)
 {
 	int ret = -ENOMEM;
 	struct DevEntry *entry;
@@ -1014,6 +1091,14 @@ static int open_dev_helper(struct parser_pdata *pdata, struct iio_device *dev,
 	thd->pdata = pdata;
 	thd->dev = dev;
 	thd->eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+
+	if (reader) {
+		thd->repeat = true;
+		thd->err = 0;
+		thd->is_writer = device_is_tx(dev);
+		thd->active = true;
+		thd->reader = reader;
+	}
 
 retry:
 	/* Atomically look up the thread and make sure that it is still active
@@ -1083,6 +1168,10 @@ retry:
 				if (ret)
 					break;
 			}
+
+			if (reader)
+				thd->nb = samples_count * thd->sample_size;
+			pthread_cond_signal(&entry->rw_ready_cond);
 			pthread_mutex_unlock(&entry->thdlist_lock);
 
 			if (ret == 0)
@@ -1091,6 +1180,7 @@ retry:
 				remove_thd_entry(thd);
 			else
 				SLIST_INSERT_HEAD(&pdata->thdlist_head, thd, parser_list_entry);
+
 			return ret;
 		} else {
 			pthread_mutex_unlock(&entry->thdlist_lock);
@@ -1144,6 +1234,10 @@ retry:
 		if (ret)
 			break;
 	}
+
+	if (reader)
+		thd->nb = samples_count * thd->sample_size;
+	pthread_cond_signal(&entry->rw_ready_cond);
 	pthread_mutex_unlock(&entry->thdlist_lock);
 
 	if (ret == 0)
@@ -1152,6 +1246,7 @@ retry:
 		remove_thd_entry(thd);
 	else
 		SLIST_INSERT_HEAD(&pdata->thdlist_head, thd, parser_list_entry);
+
 	return ret;
 
 err_free_entry_mask:
@@ -1160,13 +1255,15 @@ err_free_entry:
 	free(entry);
 err_free_thd:
 	close(thd->eventfd);
+	if (thd->reader)
+		iiod_reader_destroy(thd->reader);
 	free(thd);
 err_free_words:
 	free(words);
 	return ret;
 }
 
-static int close_dev_helper(struct parser_pdata *pdata, struct iio_device *dev)
+int close_dev_helper(struct parser_pdata *pdata, struct iio_device *dev)
 {
 	struct ThdEntry *t;
 
@@ -1205,7 +1302,7 @@ int open_dev(struct parser_pdata *pdata, struct iio_device *dev,
 	get_mask(mask, len, words);
 
 	ret = open_dev_helper(pdata, dev, samples_count, words, nb_words,
-			      cyclic);
+			      cyclic, NULL);
 	if (ret < 0)
 		free(words);
 
@@ -1221,11 +1318,13 @@ int close_dev(struct parser_pdata *pdata, struct iio_device *dev)
 }
 
 ssize_t rw_dev(struct parser_pdata *pdata, struct iio_device *dev,
-		unsigned int nb, bool is_write)
+	       unsigned int nb, bool is_write)
 {
-	ssize_t ret = rw_buffer(pdata, dev, nb, is_write);
-	if (ret <= 0 || is_write)
-		print_value(pdata, ret);
+	ssize_t ret = rw_buffer(pdata, dev, nb, is_write, false);
+	if (ret <= 0 || is_write) {
+		if (!pdata->binary)
+			print_value(pdata, ret);
+	}
 	return ret;
 }
 
@@ -1501,6 +1600,7 @@ void interpreter(struct iio_context *ctx, int fd_in, int fd_out, bool verbose,
 
 	pdata.ctx = ctx;
 	pdata.stop = false;
+	pdata.binary = false;
 	pdata.fd_in = fd_in;
 	pdata.fd_out = fd_out;
 	pdata.verbose = verbose;
@@ -1550,9 +1650,12 @@ void interpreter(struct iio_context *ctx, int fd_in, int fd_out, bool verbose,
 		if (verbose)
 			output(&pdata, "iio-daemon > ");
 		ret = yyparse(scanner);
-	} while (!pdata.stop && ret >= 0);
+	} while (!pdata.stop && !pdata.binary && ret >= 0);
 
 	yylex_destroy(scanner);
+
+	if (pdata.binary)
+		binary_parse(&pdata);
 
 	/* Close all opened devices */
 	for (i = 0; i < iio_context_get_devices_count(ctx); i++)
@@ -1564,4 +1667,11 @@ void interpreter(struct iio_context *ctx, int fd_in, int fd_out, bool verbose,
 		close(pdata.aio_eventfd);
 	}
 #endif
+}
+
+void enable_binary(struct parser_pdata *pdata)
+{
+	pdata->binary = true;
+
+	print_value(pdata, 0);
 }

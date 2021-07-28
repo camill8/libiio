@@ -45,6 +45,7 @@
 #define TEST_BIT(addr, bit) (!!(*(((uint32_t *) addr) + BIT_WORD(bit)) \
 		& BIT_MASK(bit)))
 
+struct iiod_reader;
 struct thread_pool;
 extern struct thread_pool *main_thread_pool;
 
@@ -56,8 +57,9 @@ enum iio_attr_type {
 
 struct parser_pdata {
 	struct iio_context *ctx;
-	bool stop, verbose;
+	bool stop, binary, verbose;
 	int fd_in, fd_out;
+	int resp_fd[2];
 
 	SLIST_HEAD(ParserDataThdHead, ThdEntry) thdlist_head;
 
@@ -96,12 +98,21 @@ int start_usb_daemon(struct iio_context *ctx, const char *ffs,
 		struct thread_pool *pool,
 		const void *xml_zstd, size_t xml_zstd_len);
 
+int binary_parse(struct parser_pdata *pdata);
+
+void enable_binary(struct parser_pdata *pdata);
+
 int open_dev(struct parser_pdata *pdata, struct iio_device *dev,
 		size_t samples_count, const char *mask, bool cyclic);
 int close_dev(struct parser_pdata *pdata, struct iio_device *dev);
 
 ssize_t rw_dev(struct parser_pdata *pdata, struct iio_device *dev,
 		unsigned int nb, bool is_write);
+
+int open_dev_helper(struct parser_pdata *pdata, struct iio_device *dev,
+		    size_t samples_count, uint32_t *words, size_t nb_words,
+		    bool cyclic, struct iiod_reader *reader);
+int close_dev_helper(struct parser_pdata *pdata, struct iio_device *dev);
 
 ssize_t read_dev_attr(struct parser_pdata *pdata, struct iio_device *dev,
 		const char *attr, enum iio_attr_type type);
@@ -122,6 +133,7 @@ int set_buffers_count(struct parser_pdata *pdata,
 		struct iio_device *dev, long value);
 
 ssize_t read_line(struct parser_pdata *pdata, char *buf, size_t len);
+ssize_t read_all(struct parser_pdata *pdata, void *dst, size_t len);
 ssize_t write_all(struct parser_pdata *pdata, const void *src, size_t len);
 
 static __inline__ void output(struct parser_pdata *pdata, const char *text)
