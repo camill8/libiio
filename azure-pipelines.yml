@@ -177,3 +177,28 @@ stages:
           MAPPED_VAR: $(SERVER_ADDRESS)
         condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
         displayName: "Push artifacts to SW Downloads"
+  - job: PushToGithubRelease
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/staging/deployment'))
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+      - task: DownloadPipelineArtifact@2
+        inputs:
+          path: '$(Build.SourcesDirectory)'
+      - task: ArchiveFiles@2
+        displayName: Tar Linux artifacts
+        inputs:
+          rootFolderOrFile: '$(Build.SourcesDirectory)/Linux-CentOS-7-x86_64'
+          archiveType: 'tar'
+          tarCompression: 'gz'
+          archiveFile: '$(Build.SourcesDirectory)/Linux-CentOS-7-x86_64.tar.gz'
+          replaceExistingArchive: true
+      - task: GithubRelease@0
+        displayName: 'Attach artifacts to GitHub Release'
+        inputs:
+          gitHubConnection: libiio-release-v0.22
+          repositoryName: analogdevicesinc/libiio
+          action: edit
+          target: e2ba5d485bc7890c914c24a32e606a8d47b1bf4b
+          tag: v0.22
+          assets: $(Build.SourcesDirectory)/Linux-CentOS-7-x86_64.tar.gz
