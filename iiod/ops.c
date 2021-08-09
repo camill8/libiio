@@ -875,7 +875,7 @@ static uint32_t *get_mask(const char *mask, size_t *len)
 		return NULL;
 
 	ptr = words + nb;
-	while (*mask) {
+	while (ptr > words) {
 		char buf[9];
 		snprintf(buf, sizeof(buf), "%.*s", 8, mask);
 		sscanf(buf, "%08x", --ptr);
